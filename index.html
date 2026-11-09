@@ -135,6 +135,55 @@ function makeExif(id) {
   return app1;
 }
 
+// MOV: Still-Image-Time-Metadatenspur ergänzen (nötig, damit iOS das Paar als Live Foto erkennt)
+function patchMov(mov) {
+  const enc = s => new TextEncoder().encode(s);
+  const cat = a => { const o = new Uint8Array(a.reduce((t, x) => t + x.length, 0)); let p = 0; for (const x of a) { o.set(x, p); p += x.length; } return o; };
+  const u32 = v => new Uint8Array([v >>> 24 & 255, v >>> 16 & 255, v >>> 8 & 255, v & 255]);
+  const u16 = v => new Uint8Array([v >> 8 & 255, v & 255]);
+  const z = n => new Uint8Array(n);
+  const box = (t, ...p) => { const b = cat(p); return cat([u32(b.length + 8), typeof t === 'string' ? enc(t) : t, b]); };
+  const full = (t, v, ...p) => box(t, u32(v), ...p);
+  const out = mov.slice(), dv = new DataView(out.buffer);
+  const rd = o => dv.getUint32(o);
+  const tag = o => String.fromCharCode(out[o], out[o + 1], out[o + 2], out[o + 3]);
+  const kids = (s, e) => { const r = []; while (s + 8 <= e) { const sz = rd(s); if (sz < 8) throw new Error('box'); r.push({ t: tag(s + 4), s, e: s + sz }); s += sz; } return r; };
+  const sub = (b, t) => kids(b.s + 8, b.e).filter(x => x.t === t);
+  const top = kids(0, out.length);
+  const moov = top.find(b => b.t === 'moov'), mdat = top.find(b => b.t === 'mdat');
+  if (!moov || !mdat) throw new Error('moov/mdat fehlt');
+  const mvhd = sub(moov, 'mvhd')[0];
+  if (out[mvhd.s + 8] !== 0) throw new Error('mvhd v1');
+  const mts = rd(mvhd.s + 20), mdur = rd(mvhd.s + 24), nextId = rd(mvhd.s + 104);
+  const D = 600, sd = Math.round(mdur / mts * D), st = Math.round(mdur / 2);
+  const entry = box('mebx', z(6), u16(1), box('keys', box(u32(1),
+    box('keyd', enc('mdta'), enc('com.apple.quicktime.still-image-time')),
+    box('dtyp', u32(0), enc('com.apple.metadata.datatype.int8')))));
+  const matrix = cat([0x10000, 0, 0, 0, 0x10000, 0, 0, 0, 0x40000000].map(u32));
+  const makeTrak = off => box('trak',
+    full('tkhd', 3, u32(0), u32(0), u32(nextId), u32(0), u32(mdur), z(8), u16(0), u16(0), u16(0), u16(0), matrix, u32(0), u32(0)),
+    box('edts', full('elst', 0, u32(2), u32(st), u32(0xFFFFFFFF), u32(0x10000), u32(mdur - st), u32(0), u32(0x10000))),
+    box('mdia',
+      full('mdhd', 0, u32(0), u32(0), u32(D), u32(sd), u16(0x55c4), u16(0)),
+      full('hdlr', 0, u32(0), enc('meta'), z(12), enc('Metadata\0')),
+      box('minf', full('nmhd', 0), box('dinf', full('dref', 0, u32(1), full('url ', 1))),
+        box('stbl', full('stsd', 0, u32(1), entry), full('stts', 0, u32(1), u32(1), u32(sd)),
+          full('stsc', 0, u32(1), u32(1), u32(1), u32(1)), full('stsz', 0, u32(9), u32(1)),
+          full('stco', 0, u32(1), u32(off))))));
+  const T = makeTrak(0).length;
+  const trak = makeTrak(out.length + T + 8);
+  dv.setUint32(mvhd.s + 104, nextId + 1);
+  if (moov.s < mdat.s) {
+    for (const tr of sub(moov, 'trak')) for (const md of sub(tr, 'mdia')) for (const mi of sub(md, 'minf')) for (const sb of sub(mi, 'stbl')) {
+      if (sub(sb, 'co64').length) throw new Error('co64');
+      for (const sc of sub(sb, 'stco')) { const n = rd(sc.s + 12); for (let i = 0; i < n; i++) { const p = sc.s + 16 + 4 * i; dv.setUint32(p, rd(p) + T); } }
+    }
+  }
+  const oldMoov = out.subarray(moov.s, moov.e);
+  const newMoov = cat([u32(oldMoov.length + T), oldMoov.subarray(4), trak]);
+  return cat([out.subarray(0, moov.s), newMoov, out.subarray(moov.e), box('mdat', new Uint8Array([0, 0, 0, 9, 0, 0, 0, 1, 0]))]);
+}
+
 $('go').onclick = async () => {
   if (!file) return;
   $('go').disabled = true; $('out').classList.add('hide');
@@ -157,7 +206,8 @@ $('go').onclick = async () => {
       '-f', 'mov', 'out.mov']);
     status('Erzeuge Standbild …');
     await ff.exec(['-ss', String(ss + dur / 2), '-i', 'in', '-frames:v', '1', '-vf', vf, '-q:v', '2', 'still.jpg']);
-    const mov = await ff.readFile('out.mov');
+    let mov = await ff.readFile('out.mov');
+    try { mov = patchMov(mov); } catch (err) { console.warn('Still-Image-Time-Spur nicht ergänzt', err); }
     const jpg = await ff.readFile('still.jpg');
     const exif = makeExif(id);
     const fixed = new Uint8Array(jpg.length + exif.length);
